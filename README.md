@@ -45,7 +45,7 @@ Unlike traditional study tools that just quiz you, CertBrain:
 
 ## 🎬 Demo Video
 
-> **[▶️ Watch the full demo on YouTube](YOUR_YOUTUBE_LINK_HERE)**
+> **[▶️ Watch the full demo on YouTube](https://youtu.be/tlnmA0QKU08)**
 
 ---
 

@@ -2,7 +2,7 @@
 
 Presents AI-generated adaptive multiple-choice questions one at a time.
 Questions are generated in real-time using the DiagnosticAgent LLM call.
-Difficulty adapts based on IRT theta estimates per objective.
+Difficulty adapts using CAT rules: correct → move up, wrong → move down.
 """
 
 from __future__ import annotations
@@ -36,16 +36,17 @@ hr{border-color:rgba(255,255,255,.08)!important;}
 """, unsafe_allow_html=True)
 
 TOTAL_QUESTIONS = 10
-DIFFICULTY_SEQUENCE = ["easy", "medium", "medium", "hard", "medium",
-                       "hard", "medium", "easy", "hard", "medium"]
+
+# CAT difficulty labels and display config
+_DIFF_EMOJI = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
+_DIFF_LABEL = {"easy": "EASY", "medium": "MEDIUM", "hard": "HARD"}
 
 
-def _theta_to_difficulty(theta: float) -> str:
-    if theta < -0.3:
-        return "easy"
-    if theta > 0.3:
-        return "hard"
-    return "medium"
+def _next_difficulty(current: str, was_correct: bool) -> str:
+    """CAT adaptation: correct → move up one level, wrong → move down."""
+    levels = ["easy", "medium", "hard"]
+    idx = levels.index(current)
+    return levels[min(idx + 1, 2) if was_correct else max(idx - 1, 0)]
 
 
 def _theta_to_mastery(theta: float) -> float:
@@ -61,8 +62,10 @@ def _init():
         "diag_selected": None,
         "diag_submitted": False,
         "diag_theta": {},
-        "diag_questions": [],      # generated on demand, cached here
-        "diag_objectives": None,   # loaded once from backend
+        "diag_questions": [],           # generated on demand, cached here
+        "diag_objectives": None,        # loaded once from backend
+        "diag_difficulty": "medium",    # CAT: current difficulty (starts MEDIUM)
+        "diag_difficulty_history": [],  # CAT: progression per answered question
         "student_name": "Student",
         "selected_cert_name": "Azure Fundamentals",
         "exam_uid": "exam.az-900",
@@ -95,8 +98,8 @@ def _get_or_generate_question(idx: int) -> dict | None:
         return None
 
     obj = objectives[idx % len(objectives)]
-    theta = st.session_state["diag_theta"].get(obj["id"], 0.0)
-    difficulty = _theta_to_difficulty(theta)
+    # CAT: use the globally tracked difficulty (not theta-derived)
+    difficulty = st.session_state.get("diag_difficulty", "medium")
 
     from ui.backend import generate_question
     with st.spinner(f"Generating question {idx + 1}..."):
@@ -221,6 +224,26 @@ if done:
                 unsafe_allow_html=True,
             )
 
+    # CAT difficulty progression
+    diff_history = st.session_state.get("diag_difficulty_history", [])
+    if diff_history:
+        _diff_colors_hex = {"easy": "#00e676", "medium": "#f0c040", "hard": "#e03c3c"}
+
+        def _diff_span(d: str) -> str:
+            c = _diff_colors_hex.get(d, "#888")
+            e = _DIFF_EMOJI.get(d, "🟡")
+            l = _DIFF_LABEL.get(d, "?")
+            return f"<span style='color:{c};font-weight:600;'>{e}{l}</span>"
+
+        progression_html = " &rarr; ".join(_diff_span(d) for d in diff_history)
+        st.markdown(
+            f"<div style='background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.07);"
+            f"border-radius:10px;padding:12px 16px;font-size:12px;'>"
+            f"<span style='color:#666;'>Difficulty progression: </span>{progression_html}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Continue to Knowledge Map →", use_container_width=True):
         st.session_state["diagnostic_done"] = True
@@ -245,7 +268,17 @@ elif idx < TOTAL_QUESTIONS:
 
     col_q, col_meta = st.columns([3, 1])
     with col_meta:
-        st.markdown(difficulty_badge(q["difficulty"]), unsafe_allow_html=True)
+        # CAT difficulty indicator (🟢 EASY / 🟡 MEDIUM / 🔴 HARD)
+        diff_key = q["difficulty"]
+        diff_colors = {"easy": "#00e676", "medium": "#f0c040", "hard": "#e03c3c"}
+        diff_color  = diff_colors.get(diff_key, "#888")
+        st.markdown(
+            f"<div style='font-size:11px;color:#888;margin-bottom:2px;'>Difficulty</div>"
+            f"<div style='font-size:22px;font-weight:700;color:{diff_color};'>"
+            f"{_DIFF_EMOJI.get(diff_key,'🟡')} {_DIFF_LABEL.get(diff_key,'MEDIUM')}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(bloom_badge(q["bloom"]), unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
@@ -321,20 +354,29 @@ elif idx < TOTAL_QUESTIONS:
                     unsafe_allow_html=True,
                 )
 
-        # Update theta (IRT-lite)
-        theta = st.session_state["diag_theta"]
-        oid   = q["objective_id"]
-        delta_map = {("easy", True): 0.15, ("medium", True): 0.30, ("hard", True): 0.50,
-                     ("easy", False): -0.40, ("medium", False): -0.25, ("hard", False): -0.10}
-        theta[oid] = max(-2.0, min(2.0, theta.get(oid, 0.0) + delta_map.get((q["difficulty"], is_correct), 0)))
-        st.session_state["diag_theta"] = theta
+        # Record answer, update theta and CAT difficulty exactly once per question.
+        # Guard prevents double-execution when Streamlit re-runs on button clicks.
+        if len(st.session_state["diag_answers"]) == idx:
+            # IRT theta update (used for mastery estimation in results)
+            theta = st.session_state["diag_theta"]
+            oid   = q["objective_id"]
+            delta_map = {("easy", True): 0.15, ("medium", True): 0.30, ("hard", True): 0.50,
+                         ("easy", False): -0.40, ("medium", False): -0.25, ("hard", False): -0.10}
+            theta[oid] = max(-2.0, min(2.0, theta.get(oid, 0.0) + delta_map.get((q["difficulty"], is_correct), 0)))
+            st.session_state["diag_theta"] = theta
 
-        st.session_state["diag_answers"].append({
-            "question_id": q["id"],
-            "objective_id": q["objective_id"],
-            "correct": is_correct,
-            "selected": selected_key,
-        })
+            # CAT: record this question's difficulty and advance to next
+            current_diff = st.session_state.get("diag_difficulty", "medium")
+            st.session_state["diag_difficulty_history"].append(current_diff)
+            st.session_state["diag_difficulty"] = _next_difficulty(current_diff, is_correct)
+
+            st.session_state["diag_answers"].append({
+                "question_id": q["id"],
+                "objective_id": q["objective_id"],
+                "correct": is_correct,
+                "selected": selected_key,
+                "difficulty": current_diff,
+            })
 
         col_next, _ = st.columns([1, 3])
         with col_next:

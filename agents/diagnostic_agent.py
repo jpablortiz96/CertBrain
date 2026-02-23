@@ -57,9 +57,13 @@ certification exams.  Each question must:
 or incorrect, referencing official Microsoft documentation concepts.
 
 ## Difficulty guidelines
-- **easy**: Tests recall / definitions.  Bloom level = REMEMBER.
-- **medium**: Tests understanding or application.  Bloom level = UNDERSTAND / APPLY.
-- **hard**: Tests analysis, evaluation, or multi-step reasoning.  Bloom level = ANALYZE / EVALUATE.
+- **easy**: Generate a BASIC recall question. Test simple definitions and fundamental concepts.
+  The student should be able to answer by remembering key terms.  Bloom level = REMEMBER.
+- **medium**: Generate an APPLICATION-level question. Test understanding of how services work
+  together. Include a realistic scenario.  Bloom level = UNDERSTAND / APPLY.
+- **hard**: Generate an ANALYSIS or EVALUATION question. Present a complex multi-service
+  scenario with trade-offs. The student must compare options and justify a choice.
+  Bloom level = ANALYZE / EVALUATE.
 
 ## Output format — strict JSON, no markdown fences
 {
@@ -126,12 +130,45 @@ class DiagnosticAgent:
     # ------------------------------------------------------------------
     @staticmethod
     def _select_difficulty(theta: float) -> Difficulty:
-        """Map current theta to the next question difficulty."""
+        """Map current theta to the next question difficulty (IRT fallback)."""
         if theta < -0.3:
             return Difficulty.EASY
         if theta > 0.3:
             return Difficulty.HARD
         return Difficulty.MEDIUM
+
+    @staticmethod
+    def _next_difficulty(current_difficulty: str, was_correct: bool) -> str:
+        """Determine next question difficulty using CAT adaptation rules.
+
+        Parameters
+        ----------
+        current_difficulty:
+            Current difficulty level as uppercase string: "EASY", "MEDIUM", or "HARD".
+        was_correct:
+            Whether the student answered the previous question correctly.
+
+        Returns
+        -------
+        str
+            Next difficulty level as uppercase string.
+
+        Examples
+        --------
+        - MEDIUM + correct  → HARD
+        - HARD   + correct  → HARD   (capped)
+        - MEDIUM + wrong    → EASY
+        - EASY   + wrong    → EASY   (floored)
+        """
+        levels = ["EASY", "MEDIUM", "HARD"]
+        current_idx = levels.index(current_difficulty.upper())
+
+        if was_correct:
+            next_idx = min(current_idx + 1, 2)
+        else:
+            next_idx = max(current_idx - 1, 0)
+
+        return levels[next_idx]
 
     @staticmethod
     def _difficulty_to_bloom(difficulty: Difficulty) -> BloomLevel:
@@ -151,12 +188,27 @@ class DiagnosticAgent:
         azure_client: AzureAIClient,
     ) -> Question:
         """Ask the LLM to generate a single exam-style question."""
+        _difficulty_instructions: dict[Difficulty, str] = {
+            Difficulty.EASY: (
+                "Generate a BASIC recall question. Test simple definitions and fundamental "
+                "concepts. The student should answer by remembering key terms."
+            ),
+            Difficulty.MEDIUM: (
+                "Generate an APPLICATION-level question. Test understanding of how services "
+                "work together. Include a realistic scenario."
+            ),
+            Difficulty.HARD: (
+                "Generate an ANALYSIS or EVALUATION question. Present a complex multi-service "
+                "scenario with trade-offs. The student must compare options and justify a choice."
+            ),
+        }
         user_msg = (
             f"Certification: {self._cert_name}\n"
             f"Objective ID: {objective.id}\n"
             f"Objective: {objective.name}\n"
             f"Description: {objective.description}\n"
-            f"Difficulty: {difficulty.value}\n\n"
+            f"Difficulty: {difficulty.value.upper()}\n"
+            f"Instruction: {_difficulty_instructions[difficulty]}\n\n"
             "Generate ONE question in the JSON format specified."
         )
 
@@ -270,9 +322,12 @@ class DiagnosticAgent:
         all_answers: list[Answer] = []
         question_count = 0
 
+        # CAT: track current difficulty per objective (all start at MEDIUM)
+        cat_difficulty: dict[str, str] = {o.id: "MEDIUM" for o in self._objectives}
+
         azure_client = AzureAIClient()
         try:
-            # Round-robin through objectives, adapting difficulty
+            # Round-robin through objectives, adapting difficulty via CAT
             obj_idx = 0
             while question_count < MAX_QUESTIONS:
                 objective = self._objectives[obj_idx % len(self._objectives)]
@@ -286,7 +341,9 @@ class DiagnosticAgent:
                         break
                     continue
 
-                difficulty = self._select_difficulty(self._theta[objective.id])
+                # Use CAT difficulty (starts MEDIUM, adapts based on previous answer)
+                diff_str = cat_difficulty[objective.id]
+                difficulty = Difficulty(diff_str.lower())
 
                 question = await self._generate_question(
                     objective, difficulty, azure_client
@@ -307,13 +364,16 @@ class DiagnosticAgent:
 
                 all_answers.append(answer)
                 self._update_theta(objective.id, answer.is_correct, difficulty)
+
+                # Advance CAT difficulty for next question on this objective
+                cat_difficulty[objective.id] = self._next_difficulty(diff_str, answer.is_correct)
                 question_count += 1
 
                 logger.info(
-                    "Q%d/%d obj=%s diff=%s correct=%s theta=%.2f",
+                    "Q%d/%d obj=%s diff=%s→%s correct=%s theta=%.2f",
                     question_count, MAX_QUESTIONS, objective.id,
-                    difficulty.value, answer.is_correct,
-                    self._theta[objective.id],
+                    diff_str, cat_difficulty[objective.id],
+                    answer.is_correct, self._theta[objective.id],
                 )
         finally:
             await azure_client.close()
